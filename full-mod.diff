@@ -1,0 +1,629 @@
+diff --git a/src/objects/ghost-player.ts b/src/objects/ghost-player.ts
+new file mode 100644
+index 0000000..a3d98c8
+--- /dev/null
++++ b/src/objects/ghost-player.ts
+@@ -0,0 +1,102 @@
++import { DepthLayer, PLAYER_SIZE } from '../consts/globals'
++import { GhostFrame } from '../utils/ghost'
++
++const GHOST_COLOR = 0x29adff
++
++/**
++ * Représentation visuelle du fantôme (meilleur temps).
++ * Ne participe à aucune physique/collision : il rejoue simplement,
++ * frame par frame, les positions enregistrées lors du meilleur run.
++ */
++export default class GhostPlayer extends Phaser.GameObjects.Container {
++  private sprite: Phaser.GameObjects.Rectangle
++  private label: Phaser.GameObjects.Text
++  private frames: GhostFrame[]
++  private frameCursor = 0
++
++  constructor(scene: Phaser.Scene, frames: GhostFrame[]) {
++    const start = frames[0] ?? { x: 0, y: 0 }
++    super(scene, start.x, start.y)
++    this.frames = frames
++
++    this.sprite = scene.add.rectangle(0, 0, PLAYER_SIZE, PLAYER_SIZE, GHOST_COLOR, 0.35)
++    this.sprite.setStrokeStyle(3, GHOST_COLOR, 0.8)
++    this.add(this.sprite)
++
++    this.label = scene.add.text(0, -PLAYER_SIZE / 2 - 20, 'Meilleur temps', {
++      fontFamily: 'monospace',
++      fontSize: '14px',
++      color: '#29adff',
++    })
++    this.label.setOrigin(0.5, 1)
++    this.add(this.label)
++
++    this.setSize(PLAYER_SIZE, PLAYER_SIZE)
++    this.setDepth(DepthLayer.Bobby)
++    this.setVisible(false)
++    scene.add.existing(this)
++    console.log('[Ghost] GhostPlayer construit - position de départ:', start.x, start.y, '- nb frames:', frames.length)
++  }
++
++  /** Durée totale (ms) du run enregistré. */
++  get duration() {
++    return this.frames.length ? this.frames[this.frames.length - 1].t : 0
++  }
++
++  /** Accès en lecture seule aux frames enregistrées (utile pour le calcul de delta). */
++  get recordedFrames(): readonly GhostFrame[] {
++    return this.frames
++  }
++
++  /**
++   * Retourne le temps (ms) auquel le fantôme se trouvait le plus proche de la position X donnée.
++   * Utilisé pour calculer le delta en direct (avance/retard par rapport au meilleur temps).
++   * Retourne null si aucune frame n'est enregistrée.
++   */
++  getElapsedAtX(x: number): number | null {
++    if (!this.frames.length) return null
++
++    let closest = this.frames[0]
++    let closestDist = Math.abs(closest.x - x)
++
++    for (let i = 1; i < this.frames.length; i++) {
++      const dist = Math.abs(this.frames[i].x - x)
++      if (dist < closestDist) {
++        closest = this.frames[i]
++        closestDist = dist
++      }
++    }
++
++    return closest.t
++  }
++
++  /** À appeler au moment où le timer redémarre (nouvelle tentative). */
++  reset() {
++    this.frameCursor = 0
++    this.setVisible(true)
++    this.setAlpha(1)
++  }
++
++  /** Positionne le fantôme selon le temps écoulé (ms) depuis le début du run courant. */
++  playAt(elapsed: number) {
++    if (!this.frames.length) return
++
++    if (elapsed >= this.duration) {
++      // Le fantôme a fini sa course : on le laisse disparaître en fondu.
++      this.setVisible(false)
++      return
++    }
++
++    while (this.frameCursor < this.frames.length - 2 && this.frames[this.frameCursor + 1].t <= elapsed) {
++      this.frameCursor++
++    }
++
++    const current = this.frames[this.frameCursor]
++    const next = this.frames[this.frameCursor + 1] ?? current
++    const span = next.t - current.t || 1
++    const ratio = Phaser.Math.Clamp((elapsed - current.t) / span, 0, 1)
++
++    this.x = Phaser.Math.Linear(current.x, next.x, ratio)
++    this.y = Phaser.Math.Linear(current.y, next.y, ratio)
++  }
++}
+diff --git a/src/scenes/game-scene.ts b/src/scenes/game-scene.ts
+index 5bde44e..894f188 100644
+--- a/src/scenes/game-scene.ts
++++ b/src/scenes/game-scene.ts
+@@ -33,7 +33,11 @@ import SceneKey from '../consts/scene-key'
+ import TextureKey, { IconsKey } from '../consts/texture-key'
+ import { levelsData } from '../levels'
+ import { addDesignEvent, addProgressionEvent, ProgressionEventType } from '../utils/analytics'
+-import { getCurrentTrail, getLevelTotalCoins, unlockLevel } from '../utils/level'
++import { getCurrentTrail, getLevelInfo, getLevelTotalCoins, unlockLevel } from '../utils/level'
++import { getGhostRun, saveGhostRun, GhostFrame } from '../utils/ghost'
++import { addHistoryEntry } from '../utils/history'
++import { addAnyPercentLevelTime, getAnyPercentRun, saveBestAnyPercentTimeIfBetter, stopAnyPercentRun } from '../utils/any-percent'
++import GhostPlayer from '../objects/ghost-player'
+ import { transitionEventsEmitter } from '../utils/transition'
+ import { isTouchingFromAbove } from '../utils/helpers'
+ import AudioScene from './audio-scene'
+@@ -126,6 +130,11 @@ export default class GameScene extends Phaser.Scene {
+   private checkpointFlag!: Phaser.GameObjects.Triangle
+   private checkpoint!: Phaser.GameObjects.Container
+   private player!: Player
++  private ghostPlayer: GhostPlayer | null = null
++  private recordedGhostFrames: GhostFrame[] = []
++  private ghostRunStartTime = 0
++  public currentGhostDelta: number | null = null
++  private lastDeltaComputeTime = 0
+   private playerStartPos: Phaser.GameObjects.Rectangle | null = null
+   private playerShadowHitbox!: Phaser.GameObjects.Rectangle
+   private coinsEmitter!: Phaser.GameObjects.Particles.ParticleEmitter
+@@ -183,6 +192,10 @@ export default class GameScene extends Phaser.Scene {
+     return this.player
+   }
+ 
++  get currentLevelNumber() {
++    return this.currentLevel
++  }
++
+   init(data: { number?: number; level?: DataLevel; isCustomLevelRun?: boolean }) {
+     if (data.number) {
+       this.currentLevel = data.number
+@@ -406,6 +419,29 @@ export default class GameScene extends Phaser.Scene {
+     const trail = getCurrentTrail()
+     this.player = new Player(this, startingPos.x, startingPos.y)
+     this.player.setTrail(trail)
++
++    // Fantôme du meilleur temps (mode Speedrun uniquement)
++    this.ghostPlayer = null
++    console.log(
++      '[Ghost] create() - isSpeedrunMode:',
++      this.isSpeedrunMode,
++      '- currentLevel:',
++      this.currentLevel,
++      '- isCheckpointActive:',
++      this.isCheckpointActive,
++    )
++    if (this.isSpeedrunMode && this.currentLevel && !this.isCheckpointActive) {
++      const ghostRun = getGhostRun(this.currentLevel)
++      console.log('[Ghost] Run trouvé en localStorage ?', !!ghostRun, ghostRun ? `(${ghostRun.frames.length} frames)` : '')
++      if (ghostRun) {
++        this.ghostPlayer = new GhostPlayer(this, ghostRun.frames)
++        console.log('[Ghost] GhostPlayer créé avec succès')
++      }
++    } else {
++      console.log('[Ghost] Conditions non remplies, pas de fantôme chargé pour ce niveau')
++    }
++    this.recordedGhostFrames = []
++
+     this.playerStartPos = null
+     if (this.isCustomLevel && !this.isCustomLevelRun) {
+       this.playerStartPos = this.add.rectangle(
+@@ -645,6 +681,42 @@ export default class GameScene extends Phaser.Scene {
+       justTriggeredJump,
+     })
+ 
++    // Fantôme : enregistrement de la position courante et lecture du meilleur run
++    if (this.isSpeedrunMode && this.timerStarted) {
++      this.recordedGhostFrames.push({
++        t: time - this.ghostRunStartTime,
++        x: this.player.x,
++        y: this.player.y,
++      })
++
++      if (this.ghostPlayer) {
++        this.ghostPlayer.playAt(time - this.ghostRunStartTime)
++
++        // Delta en direct : comparaison de la progression avec le fantôme (throttlé, ~150ms)
++        if (time - this.lastDeltaComputeTime > 150) {
++          this.lastDeltaComputeTime = time
++          const ghostElapsedAtSameX = this.ghostPlayer.getElapsedAtX(this.player.x)
++          if (ghostElapsedAtSameX !== null) {
++            this.currentGhostDelta = time - this.ghostRunStartTime - ghostElapsedAtSameX
++          }
++        }
++
++        if (Math.floor(time / 1000) !== Math.floor((time - delta) / 1000)) {
++          console.log(
++            '[Ghost] lecture en cours - t:',
++            Math.round(time - this.ghostRunStartTime),
++            '- visible:',
++            this.ghostPlayer.visible,
++            '- pos:',
++            Math.round(this.ghostPlayer.x),
++            Math.round(this.ghostPlayer.y),
++            '- delta:',
++            this.currentGhostDelta,
++          )
++        }
++      }
++    }
++
+     // Sortie du monde
+     if (
+       this.player.y - (this.player.body as Phaser.Physics.Arcade.Body).height / 2 >
+@@ -946,6 +1018,14 @@ export default class GameScene extends Phaser.Scene {
+     this._canMove = true
+     this.events.emit(EventKey.StartTimer)
+ 
++    // Fantôme : (ré)initialisation de l'enregistrement et de la lecture
++    this.recordedGhostFrames = []
++    this.ghostRunStartTime = this.time.now
++    this.currentGhostDelta = null
++    this.lastDeltaComputeTime = 0
++    this.ghostPlayer?.reset()
++    console.log('[Ghost] startTimer() - enregistrement réinitialisé, ghostPlayer présent ?', !!this.ghostPlayer)
++
+     // Analytics
+     this.trackProgression(ProgressionEventType.Start)
+   }
+@@ -1033,6 +1113,61 @@ export default class GameScene extends Phaser.Scene {
+     })
+     this.audioManager.playSfx(AudioKey.SfxWin)
+ 
++    // Fantôme : on sauvegarde ce run s'il bat le meilleur temps enregistré,
++    // ou s'il n'existe pas encore de fantôme pour ce niveau (ex: temps réalisé avant l'installation du mod)
++    if (this.isSpeedrunMode && this.currentLevel && !this.startedFromCheckpoint) {
++      const newTime = this.time.now - this.ghostRunStartTime
++      const previousBestTime = getLevelInfo(this.currentLevel)?.time || Infinity
++      const hasExistingGhost = !!getGhostRun(this.currentLevel)
++      console.log(
++        '[Ghost] teleport() - newTime:',
++        Math.round(newTime),
++        '- previousBestTime:',
++        previousBestTime,
++        '- fantôme déjà existant ?',
++        hasExistingGhost,
++        '- frames enregistrées:',
++        this.recordedGhostFrames.length,
++      )
++      if ((newTime < previousBestTime || !hasExistingGhost) && this.recordedGhostFrames.length > 1) {
++        saveGhostRun(this.currentLevel, { frames: this.recordedGhostFrames })
++        console.log('[Ghost] Run fantôme sauvegardé pour le niveau', this.currentLevel)
++      } else {
++        console.log('[Ghost] Pas un meilleur temps et fantôme déjà existant, run non sauvegardé')
++      }
++
++      // Historique des derniers temps (indépendamment du record)
++      addHistoryEntry(this.currentLevel, newTime)
++
++      // Any% : on ajoute le temps de ce niveau si un run est actif sur ce monde
++      const world = Math.ceil(this.currentLevel / NUM_LEVELS_BY_WORLD)
++      const isLastLevelOfWorld = this.currentLevel % NUM_LEVELS_BY_WORLD === 0
++      const anyPercentState = addAnyPercentLevelTime(world, this.currentLevel, newTime)
++      console.log('[Any%] Etat après ce niveau :', anyPercentState)
++      if (anyPercentState && isLastLevelOfWorld) {
++        const isNewRecord = saveBestAnyPercentTimeIfBetter(world, anyPercentState.totalTime)
++        console.log(
++          '[Any%] Monde',
++          world,
++          'terminé en',
++          Math.round(anyPercentState.totalTime),
++          'ms - nouveau record ?',
++          isNewRecord,
++        )
++        stopAnyPercentRun()
++      }
++    } else {
++      console.log(
++        '[Ghost] teleport() - sauvegarde ignorée (isSpeedrunMode:',
++        this.isSpeedrunMode,
++        '- currentLevel:',
++        this.currentLevel,
++        '- startedFromCheckpoint:',
++        this.startedFromCheckpoint,
++        ')',
++      )
++    }
++
+     if (this.currentLevel && this.currentLevel < Object.keys(levelsData).length) {
+       unlockLevel(this.currentLevel + 1)
+     }
+@@ -1076,6 +1211,16 @@ export default class GameScene extends Phaser.Scene {
+     this.events.emit(EventKey.StopTimer)
+     this.player.die()
+ 
++    // Any% : une mort annule la tentative en cours sur ce monde
++    if (this.isSpeedrunMode && this.currentLevel) {
++      const world = Math.ceil(this.currentLevel / NUM_LEVELS_BY_WORLD)
++      const anyPercentState = getAnyPercentRun()
++      if (anyPercentState?.world === world) {
++        console.log('[Any%] Mort en cours de run, tentative annulée')
++        stopAnyPercentRun()
++      }
++    }
++
+     // Analytics
+     this.trackProgression(ProgressionEventType.Fail)
+     this.trackDesign(AnalyticsKey.PlayerDeath)
+diff --git a/src/scenes/hud-scene.ts b/src/scenes/hud-scene.ts
+index 3a24fe6..6fc2007 100644
+--- a/src/scenes/hud-scene.ts
++++ b/src/scenes/hud-scene.ts
+@@ -1,12 +1,15 @@
+ import DataKey from '../consts/data-key'
+ import EventKey from '../consts/event-key'
+-import { CINEMATIC_FRAME_HEIGHT } from '../consts/globals'
++import { CINEMATIC_FRAME_HEIGHT, NUM_LEVELS_BY_WORLD } from '../consts/globals'
+ import { GameMode } from '../consts/level'
+ import SceneKey from '../consts/scene-key'
+ import TextureKey, { IconsKey } from '../consts/texture-key'
+ import IconButton from '../objects/ui/icon-button'
++import TextButton from '../objects/ui/text-button'
+ import Panel from '../objects/ui/panel'
+ import { getLevelInfo, getLevelTotalCoins, updateLevelInfo } from '../utils/level'
++import { exportGhostRun, importGhostRun } from '../utils/ghost'
++import { getAnyPercentRun } from '../utils/any-percent'
+ import { stringifyTime } from '../utils/time'
+ import { transitionEventsEmitter } from '../utils/transition'
+ import GameScene from './game-scene'
+@@ -17,12 +20,16 @@ export default class HUDScene extends Phaser.Scene {
+   private showCinematicFrames: boolean
+   private coinsText!: Phaser.GameObjects.Text
+   private timerText!: Phaser.GameObjects.Text
++  private bestTimeText!: Phaser.GameObjects.Text
++  private deltaText!: Phaser.GameObjects.Text
++  private anyPercentText!: Phaser.GameObjects.Text
+   private panelPause!: Phaser.GameObjects.Container
+   private HUDItems!: Phaser.GameObjects.Container
+   private coinsCollected!: number
+   private timerStarted = false
+   private startTime = 0
+   private pauseTime = 0
++  private currentLevel: number | null = null
+ 
+   constructor() {
+     super({ key: SceneKey.HUD })
+@@ -45,6 +52,7 @@ export default class HUDScene extends Phaser.Scene {
+     }
+ 
+     const gameScene = this.scene.get(SceneKey.Game) as GameScene
++    this.currentLevel = gameScene.currentLevelNumber
+     const isCustomLevel = this.registry.get(DataKey.IsCustomLevel)
+     const btnPause = new IconButton(this, 1840, 80, IconsKey.Pause, this.togglePause)
+     if (!isCustomLevel) {
+@@ -79,6 +87,29 @@ export default class HUDScene extends Phaser.Scene {
+     const timerContainer = this.add.container(0, 0, [timerBg, this.timerText])
+     timerContainer.setAlpha(isSpeedrunMode ? 1 : 0)
+ 
++    // Meilleur temps affiché en permanence
++    const bestTime = this.currentLevel ? getLevelInfo(this.currentLevel)?.time : null
++    this.bestTimeText = this.add.text(40, 186, bestTime ? `Meilleur : ${stringifyTime(bestTime)}` : '', {
++      fontFamily: TextureKey.FontBody,
++      fontSize: '22px',
++      color: '#29adff',
++    })
++
++    // Delta en direct par rapport au fantôme
++    this.deltaText = this.add.text(40, 214, '', {
++      fontFamily: TextureKey.FontBody,
++      fontSize: '26px',
++      color: '#ffffff',
++    })
++
++    // Chrono Any% (somme des niveaux du monde, si un run est actif)
++    this.anyPercentText = this.add.text(width - 40, 110, '', {
++      fontFamily: TextureKey.FontHeading,
++      fontSize: '36px',
++      color: '#fee761',
++    })
++    this.anyPercentText.setOrigin(1, 0)
++
+     gameScene.events.on(EventKey.StartTimer, this.startTimer, this)
+     gameScene.events.on(EventKey.StopTimer, this.stopTimer, this)
+     gameScene.events.on(EventKey.LevelEnd, this.handleLevelEnd, this)
+@@ -113,8 +144,28 @@ export default class HUDScene extends Phaser.Scene {
+     )
+     const btnLevels = new IconButton(this, width / 2 - 120, height / 2 + 40, IconsKey.Levels, this.goToLevels)
+ 
+-    this.panelPause.add([panelOverlay, panelPauseBg, panelTxt, btnPlay, btnRestart, btnLevels])
+-    this.HUDItems = this.add.container(0, 0, [btnPause, coin, timerContainer, this.coinsText, mobileCursorsContainer])
++    const panelExtras: Phaser.GameObjects.GameObject[] = []
++    if (isSpeedrunMode && this.currentLevel) {
++      const btnExportGhost = new TextButton(this, width / 2 - 180, height / 2 + 140, 'Exporter fantôme', () =>
++        this.exportGhost()
++      )
++      const btnImportGhost = new TextButton(this, width / 2 + 180, height / 2 + 140, 'Importer fantôme', () =>
++        this.importGhost()
++      )
++      panelExtras.push(btnExportGhost, btnImportGhost)
++    }
++
++    this.panelPause.add([panelOverlay, panelPauseBg, panelTxt, btnPlay, btnRestart, btnLevels, ...panelExtras])
++    this.HUDItems = this.add.container(0, 0, [
++      btnPause,
++      coin,
++      timerContainer,
++      this.bestTimeText,
++      this.deltaText,
++      this.anyPercentText,
++      this.coinsText,
++      mobileCursorsContainer,
++    ])
+ 
+     this.events.once('shutdown', this.handleShutdown, this)
+   }
+@@ -147,6 +198,35 @@ export default class HUDScene extends Phaser.Scene {
+     gameScene.events.off(EventKey.ToggleCinematicFrames, this.toggleCinematicFrames, this)
+   }
+ 
++  exportGhost() {
++    if (!this.currentLevel) return
++    const json = exportGhostRun(this.currentLevel)
++    if (!json) {
++      window.alert('Aucun fantôme enregistré pour ce niveau pour le moment.')
++      return
++    }
++    const blob = new Blob([json], { type: 'application/json' })
++    const url = URL.createObjectURL(blob)
++    const link = document.createElement('a')
++    link.href = url
++    link.download = `ghost-level-${this.currentLevel}.json`
++    link.click()
++    URL.revokeObjectURL(url)
++  }
++
++  importGhost() {
++    if (!this.currentLevel) return
++    const json = window.prompt('Colle ici le contenu JSON du fantôme à importer :')
++    if (!json) return
++
++    const importedLevel = importGhostRun(json, this.currentLevel)
++    if (importedLevel) {
++      window.alert(`Fantôme importé pour le niveau ${importedLevel} ! Relance le niveau pour le voir en action.`)
++    } else {
++      window.alert("Ce contenu n'est pas un fantôme valide.")
++    }
++  }
++
+   goToLevels() {
+     transitionEventsEmitter.emit(EventKey.TransitionStart)
+     transitionEventsEmitter.once(
+@@ -214,6 +294,10 @@ export default class HUDScene extends Phaser.Scene {
+       ...(this.coinsCollected === levelTotalCoins && !startedFromCheckpoint && { shinyCoin: true }),
+     })
+ 
++    if (this.registry.get(DataKey.GameMode) === GameMode.Speedrun && newTime < previousBestTime) {
++      this.bestTimeText.setText(`Meilleur : ${stringifyTime(newTime)}`)
++    }
++
+     this.startTime = 0
+   }
+ 
+@@ -236,8 +320,39 @@ export default class HUDScene extends Phaser.Scene {
+   update() {
+     const isPaused = this.registry.get(DataKey.IsPaused)
+ 
+-    if (this.startTime === 0 || !this.timerStarted || isPaused) return
+-    const time = stringifyTime(this.time.now - this.startTime)
+-    this.timerText.setText(time)
++    if (isPaused) return
++
++    if (this.startTime !== 0 && this.timerStarted) {
++      const time = stringifyTime(this.time.now - this.startTime)
++      this.timerText.setText(time)
++    }
++
++    // Delta en direct par rapport au fantôme
++    if (this.timerStarted) {
++      const gameScene = this.scene.get(SceneKey.Game) as GameScene
++      const delta = gameScene.currentGhostDelta
++      if (delta !== null) {
++        const seconds = (delta / 1000).toFixed(2)
++        const isAhead = delta < 0
++        this.deltaText.setText(`${isAhead ? '-' : '+'}${Math.abs(Number(seconds)).toFixed(2)}s`)
++        this.deltaText.setColor(isAhead ? '#4ade80' : '#f87171')
++      } else {
++        this.deltaText.setText('')
++      }
++    } else {
++      this.deltaText.setText('')
++    }
++
++    // Chrono Any% (somme des niveaux précédents du monde + niveau en cours)
++    if (this.currentLevel) {
++      const world = Math.ceil(this.currentLevel / NUM_LEVELS_BY_WORLD)
++      const anyPercentState = getAnyPercentRun()
++      if (anyPercentState?.world === world) {
++        const currentLevelElapsed = this.timerStarted ? this.time.now - this.startTime : 0
++        this.anyPercentText.setText(`ANY% : ${stringifyTime(anyPercentState.totalTime + currentLevelElapsed)}`)
++      } else {
++        this.anyPercentText.setText('')
++      }
++    }
+   }
+ }
+diff --git a/src/scenes/levels-scene.ts b/src/scenes/levels-scene.ts
+index 39a9a5b..8a6126a 100644
+--- a/src/scenes/levels-scene.ts
++++ b/src/scenes/levels-scene.ts
+@@ -8,6 +8,7 @@ import TextureKey, { IconsKey } from '../consts/texture-key'
+ import IconButton from '../objects/ui/icon-button'
+ import TextButton from '../objects/ui/text-button'
+ import { getCurrentWorld, getLevelInfo, getLevelTotalCoins, setCurrentWorld } from '../utils/level'
++import { getBestAnyPercentTime, startAnyPercentRun } from '../utils/any-percent'
+ import { stringifyTime } from '../utils/time'
+ import { transitionEventsEmitter } from '../utils/transition'
+ import AudioScene from './audio-scene'
+@@ -54,12 +55,32 @@ export default class LevelsScene extends Phaser.Scene {
+       })
+       .setOrigin(0.5, 0)
+ 
++    const isSpeedrunMode = this.registry.get(DataKey.GameMode) === GameMode.Speedrun
++    if (isSpeedrunMode) {
++      const bestAnyPercent = getBestAnyPercentTime(this.currentWorld)
++      this.add
++        .text(width / 2, 130, bestAnyPercent ? `Meilleur Any% : ${stringifyTime(bestAnyPercent)}` : 'Any% : aucun temps', {
++          fontFamily: TextureKey.FontBody,
++          fontSize: '32px',
++          color: '#ffffff',
++        })
++        .setOrigin(0.5, 0)
++    }
++
+     new IconButton(this, 80, 80, IconsKey.Back, () => this.goToScreen(SceneKey.Intro))
+     new IconButton(this, width - 80, 80, IconsKey.Shop, () => this.goToScreen(SceneKey.Shop))
+     new TextButton(this, width / 2, height - 120, 'Éditeur de niveaux', () => {
+       this.goToScreen(SceneKey.Game, { level: customLevel })
+     })
+ 
++    if (isSpeedrunMode) {
++      new TextButton(this, width / 2, height - 60, 'Démarrer un run Any%', () => {
++        startAnyPercentRun(this.currentWorld)
++        const firstLevelOfWorld = (this.currentWorld - 1) * NUM_LEVELS_BY_WORLD + 1
++        this.goToScreen(SceneKey.Game, { number: firstLevelOfWorld })
++      })
++    }
++
+     // Niveaux
+     const buttonOffset = 96
+     const buttonSize = 160
+diff --git a/src/utils/ghost.ts b/src/utils/ghost.ts
+new file mode 100644
+index 0000000..425f132
+--- /dev/null
++++ b/src/utils/ghost.ts
+@@ -0,0 +1,66 @@
++export interface GhostFrame {
++  t: number // temps écoulé depuis le début du run (ms)
++  x: number
++  y: number
++}
++
++export interface GhostRun {
++  frames: GhostFrame[]
++}
++
++const GHOST_KEY_PREFIX = 'ghostRun_'
++
++/**
++ * Récupère le run fantôme (meilleur temps) sauvegardé pour un niveau donné.
++ * Retourne null si aucun run n'est enregistré ou si les données sont corrompues.
++ */
++export function getGhostRun(level: number): GhostRun | null {
++  const raw = localStorage.getItem(GHOST_KEY_PREFIX + level)
++  if (!raw) return null
++
++  try {
++    const parsed = JSON.parse(raw) as GhostRun
++    if (!parsed?.frames?.length) return null
++    return parsed
++  } catch {
++    return null
++  }
++}
++
++/**
++ * Sauvegarde le run fantôme pour un niveau donné (écrase l'ancien).
++ */
++export function saveGhostRun(level: number, run: GhostRun) {
++  localStorage.setItem(GHOST_KEY_PREFIX + level, JSON.stringify(run))
++}
++
++/**
++ * Exporte le run fantôme d'un niveau sous forme de chaîne JSON, prête à être
++ * partagée (fichier, copier-coller...). Inclut le niveau pour faciliter l'import.
++ */
++export function exportGhostRun(level: number): string | null {
++  const run = getGhostRun(level)
++  if (!run) return null
++  return JSON.stringify({ level, ...run })
++}
++
++/**
++ * Importe un run fantôme depuis une chaîne JSON (exportée via exportGhostRun).
++ * Si le niveau cible est fourni, il est utilisé à la place de celui contenu dans le JSON
++ * (utile si on veut appliquer un fantôme partagé à un autre niveau).
++ * Retourne le niveau sur lequel le fantôme a été importé, ou null en cas d'échec.
++ */
++export function importGhostRun(json: string, targetLevel?: number): number | null {
++  try {
++    const parsed = JSON.parse(json) as GhostRun & { level?: number }
++    if (!parsed?.frames?.length) return null
++
++    const level = targetLevel ?? parsed.level
++    if (!level) return null
++
++    saveGhostRun(level, { frames: parsed.frames })
++    return level
++  } catch {
++    return null
++  }
++}
