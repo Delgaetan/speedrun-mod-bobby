@@ -2,8 +2,8 @@
 
 2) ouvrez le cmd à cette racine
 
-3) arrivez npm install
+3) écrivez npm install
 
-4) arrivez npm run dev
+4) écrivez npm run dev
 
 5) copiez le lien (localhost) puis jouez
