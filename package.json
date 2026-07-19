@@ -1,0 +1,22 @@
+{
+  "name": "hey-bobby",
+  "private": true,
+  "version": "0.0.24",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "gameanalytics": "^4.4.7",
+    "phaser": "^3.87.0",
+    "webfontloader": "^1.6.28"
+  },
+  "devDependencies": {
+    "@types/webfontloader": "^1.6.38",
+    "typescript": "~5.6.2",
+    "vite": "^5.4.10",
+    "vue-tsc": "^2.2.0"
+  }
+}
