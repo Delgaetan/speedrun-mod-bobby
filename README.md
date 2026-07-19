@@ -8,14 +8,12 @@ C'est un jeu de plateforme codé en javascript avec la librairie Phaser, avec co
 
 # Delgaetan - mod SpeedBobby
 
-comment utilisé
+comment lancé
 
 1) aller à la racine du mod (là où il y a l'index.html)
-
 2) ouvrez le cmd à cette racine
-
 3) écrivez npm install
-
 4) écrivez npm run dev
-
 5) copiez le lien (localhost) puis jouez
+
+une fois à l'intérieur, réinitialiser les temps, ça remettra le jeu à neuf puis jouer
